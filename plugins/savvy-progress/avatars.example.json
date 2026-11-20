@@ -1,0 +1,16 @@
+{
+  "avatars": [
+    { "match": "paranoid", "label": "Paranoid", "color": "#D95F5F",
+      "art": [" .---. ", "( ◉_◉ )", " /| |\\ "],
+      "walk": [" .---. ", "( ◉_◉ )", " \\| |/ "] },
+    { "match": "^ceo", "label": "CEO", "color": "#C9A227",
+      "art": [" _===_", " (•‿•)", " /|$|\\"] },
+    { "match": "fullstack", "label": "Fullstack", "color": "#4FA3D9",
+      "art": [" [</>]", " (■_■)", "  /|\\"] },
+    { "match": "\\bqa\\b", "label": "Senior QA", "color": "#6FBF6A",
+      "art": ["  ✓✓✓", " (o_o)", " /|☐|\\"] },
+    { "type": "web-fetch", "color": "#2BA3A3",
+      "art": ["  ~~~", " (o.o)~", " /| |\\"],
+      "walk": ["  ~~~", "~(o.o)", " /| |\\"] }
+  ]
+}

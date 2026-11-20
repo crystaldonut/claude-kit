@@ -22,4 +22,29 @@ Cost is a rough estimate from token counts and a built-in per-model price table 
 
 `autoOpen`: `savvy` (default) or `any`. With `savvy` the panel opens by itself when a `savvy-*` worker starts or a plan is reported. With `any` it also opens, once per session, when any other subagent starts. `/agents-info` toggles it either way.
 
+`avatars`: the path of an avatars file, `~/.claude/savvy-progress/avatars.json` by default. Without one, every agent row in the terminal gets a pixel crab colored by its type: savvy tiers keep their colors, the built-in types (`general-purpose`, `web-fetch`, `Explore`, `Plan`, ...) have their own, and any other type gets a color picked by its name.
+
+## Avatars
+
+The avatars file gives agents their own art, color and label. The first rule that fits an agent wins:
+
+```json
+{
+  "avatars": [
+    { "match": "paranoid", "label": "Paranoid", "color": "#D95F5F", "art": [" .---. ", "( ◉_◉ )", " /| |\\ "] },
+    { "match": "^ceo", "label": "CEO", "color": "#C9A227", "art": [" _===_", " (•‿•)", " /|$|\\"] },
+    { "type": "web-fetch", "art": ["  ~~~", " (o.o)~", " /| |\\"], "walk": ["  ~~~", "~(o.o)", " /| |\\"] }
+  ]
+}
+```
+
+- `type`: the agent type, as `subagent_type` names it. Left out, or `*`, any type.
+- `match`: a case-insensitive pattern on the agent's name (the description in the panel), so one type, say `general-purpose`, splits into roles. A pattern that does not compile drops its rule.
+- `art`: up to 4 lines of up to 16 cells, drawn beside the row. Emoji work and count as two cells, joined ones (🧑‍💼) and flags included; each line is padded so the text beside it stays put. How an emoji looks is up to the terminal's font.
+- `walk`: a second frame a running agent swaps to every second.
+- `color`: `#rrggbb`, for the art, the bar and the status mark; the desktop panel uses it too.
+- `label`: shown in place of the type on the row's second line.
+
+The panel reads the file again when it changes. A pane under 40 columns keeps the plain square. `avatars.example.json` beside this README is a starting point.
+
 Install instructions are in the [repository README](../../README.md).

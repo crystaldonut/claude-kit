@@ -367,6 +367,164 @@ const TIER_COLOR: Record<string, string> = {
 // What each savvy tier runs on, for planned tasks that have no run yet.
 const colorOf = (tier: string): string => TIER_COLOR[tier] ?? '#888780'
 
+// Agents outside savvy-flow: a color per built-in type, and for any other type a
+// spare one picked by its name, so the same type keeps its color across sessions.
+const TYPE_COLOR: Record<string, string> = {
+  'general-purpose': '#D97757',
+  'web-fetch': '#2BA3A3',
+  Explore: '#C9A227',
+  Plan: '#A86FD6',
+  'claude-code-guide': '#5B8DEF',
+  'statusline-setup': '#8AA34B',
+}
+const SPARE_COLORS = ['#D9668C', '#4FA3D9', '#C98A3A', '#6FBF6A', '#9C7CE0', '#D95F5F']
+
+// Avatars the person draws, in the file the `avatars` option names: a list of rules,
+// the first that fits an agent wins. `type` is the agent type (`*` or left out: any),
+// `match` a case-insensitive pattern on its name, so one type splits into roles:
+//   { "avatars": [{ "match": "paranoid", "label": "Paranoid", "color": "#D95F5F", "art": ["(ಠ_ಠ)"] }] }
+// `art` is up to four lines of 16 cells (an emoji takes two), `walk` a second frame
+// a running agent swaps to.
+type Avatar = { art: string[]; walk?: string[]; color?: string; label?: string }
+type AvatarRule = Avatar & { type?: string; match?: RegExp }
+type Named = { type: string; description: string }
+
+const MAX_ART_LINES = 4
+const MAX_ART_COLS = 16
+const MAX_RULES = 100
+const DEFAULT_AVATARS = '~/.claude/savvy-progress/avatars.json'
+let avatarsPath = ''
+let avatarRules: AvatarRule[] = []
+let avatarsSeen = -1
+
+// Code points a terminal draws two cells wide: emoji and the East Asian scripts.
+const WIDE_CELLS: [number, number][] = [
+  [0x1100, 0x115f], [0x231a, 0x231b], [0x2329, 0x232a], [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3],
+  [0x25fd, 0x25fe], [0x2614, 0x2615], [0x2648, 0x2653], [0x267f, 0x267f], [0x2693, 0x2693], [0x26a1, 0x26a1],
+  [0x26aa, 0x26ab], [0x26bd, 0x26be], [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4], [0x26ea, 0x26ea],
+  [0x26f2, 0x26f3], [0x26f5, 0x26f5], [0x26fa, 0x26fa], [0x26fd, 0x26fd], [0x2705, 0x2705], [0x270a, 0x270b],
+  [0x2728, 0x2728], [0x274c, 0x274c], [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797],
+  [0x27b0, 0x27b0], [0x27bf, 0x27bf], [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55], [0x2e80, 0xa4cf],
+  [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe30, 0xfe4f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1f000, 0x1faff],
+  [0x20000, 0x3fffd],
+]
+
+// Joiners, combining marks and skin tones ride on the character before them.
+const isZeroWidth = (c: number): boolean =>
+  c === 0x200d || (c >= 0x300 && c <= 0x36f) || (c >= 0xfe00 && c <= 0xfe0e) || (c >= 0x1f3fb && c <= 0x1f3ff) || (c >= 0xe0020 && c <= 0xe007f)
+
+// Two regional indicators make one flag.
+const isRegional = (c: number): boolean => c >= 0x1f1e6 && c <= 0x1f1ff
+
+// Splits a line into what a terminal draws as one character, each with its cells:
+// a joined emoji is one wide character, and VS16 (U+FE0F) makes a narrow symbol wide.
+const cellsOf = (line: string): { text: string; cells: number }[] => {
+  const out: { text: string; cells: number }[] = []
+  let isJoined = false
+  for (const ch of line) {
+    const c = ch.codePointAt(0) ?? 0
+    const last = out[out.length - 1]
+    const isFlagHalf = isRegional(c) && last !== undefined && [...last.text].length === 1 && isRegional(last.text.codePointAt(0) ?? 0)
+    if (last && (isJoined || isZeroWidth(c) || c === 0xfe0f || isFlagHalf)) {
+      last.text += ch
+      if (c === 0xfe0f) last.cells = 2
+      isJoined = c === 0x200d
+      continue
+    }
+    out.push({ text: ch, cells: WIDE_CELLS.some(([lo, hi]) => c >= lo && c <= hi) ? 2 : 1 })
+    isJoined = false
+  }
+  return out
+}
+
+const widthOf = (line: string): number => cellsOf(line).reduce((n, g) => n + g.cells, 0)
+
+// The line cut to `max` cells, never through a wide character.
+const fitCells = (line: string, max: number): string => {
+  let used = 0
+  let out = ''
+  for (const g of cellsOf(line)) {
+    if (used + g.cells > max) break
+    used += g.cells
+    out += g.text
+  }
+  return out
+}
+
+const artOf = (v: unknown): string[] | undefined =>
+  Array.isArray(v) && v.length > 0 && v.every(l => typeof l === 'string')
+    ? v.slice(0, MAX_ART_LINES).map((l: string) => fitCells(l.replace(/[\t\r\n]/g, ' '), MAX_ART_COLS))
+    : undefined
+
+const patternOf = (v: unknown): RegExp | undefined => {
+  if (typeof v !== 'string' || !v) return undefined
+  try {
+    return new RegExp(v.slice(0, 200), 'i')
+  } catch {
+    return undefined
+  }
+}
+
+const parseAvatars = (text: string): AvatarRule[] => {
+  const raw = (JSON.parse(text) as { avatars?: unknown })?.avatars
+  if (!Array.isArray(raw)) return []
+  return raw.slice(0, MAX_RULES).flatMap((v): AvatarRule[] => {
+    if (!v || typeof v !== 'object') return []
+    const o = v as Record<string, unknown>
+    const art = artOf(o.art)
+    const match = patternOf(o.match)
+    // A pattern that does not compile drops its rule rather than match every agent.
+    if (!art || (o.match !== undefined && !match)) return []
+    return [
+      {
+        art,
+        walk: artOf(o.walk),
+        color: typeof o.color === 'string' && /^#[0-9a-f]{6}$/i.test(o.color) ? o.color : undefined,
+        label: typeof o.label === 'string' && o.label.trim() ? o.label.trim().slice(0, 40) : undefined,
+        type: typeof o.type === 'string' && o.type !== '*' ? o.type : undefined,
+        match,
+      },
+    ]
+  })
+}
+
+// Read again only when the file changed; a missing or broken file means no rules.
+async function loadAvatars($: EngineInterface, path: string): Promise<void> {
+  let mtimeMs: number
+  try {
+    mtimeMs = (await $.fs.stat(path)).mtimeMs
+  } catch {
+    avatarRules = []
+    avatarsSeen = -1
+    return
+  }
+  if (mtimeMs === avatarsSeen) return
+  avatarsSeen = mtimeMs
+  try {
+    avatarRules = parseAvatars(await $.fs.read(path))
+  } catch {
+    avatarRules = []
+  }
+}
+
+const customAvatarOf = (a: Named): AvatarRule | undefined => {
+  const bare = a.type.replace(/^[^:]*:/, '')
+  return avatarRules.find(r => (!r.type || r.type === a.type || r.type === bare) && (!r.match || r.match.test(a.description)))
+}
+
+const agentColor = (a: Named): string => {
+  const own = customAvatarOf(a)?.color
+  if (own) return own
+  const type = a.type
+  const tier = tierOf(type)
+  if (tier !== 'other') return colorOf(tier)
+  const bare = type.replace(/^[^:]*:/, '')
+  if (Object.hasOwn(TYPE_COLOR, bare)) return TYPE_COLOR[bare] ?? colorOf('other')
+  let hash = 0
+  for (const ch of bare) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) >>> 0
+  return SPARE_COLORS[hash % SPARE_COLORS.length] ?? colorOf('other')
+}
+
 const TIER_MODEL: Record<string, [model: string, effort: string]> = {
   fable: ['Fable', 'high'],
   heavy: ['Opus', 'xhigh'],
@@ -696,7 +854,7 @@ const ctxOf = (a: AgentRun): number => (a.contextMax ? Math.min(100, Math.round(
 const agentSvg = (W: number, a: AgentRun, at: number): string => {
   const s = tr()
   const tier = tierOf(a.type)
-  const color = colorOf(tier)
+  const color = agentColor(a)
   const ctx = ctxOf(a)
   const textW = W - 42 - 22
   const meta = [runModel(a)]
@@ -714,7 +872,7 @@ const agentSvg = (W: number, a: AgentRun, at: number): string => {
     66,
     `${rowCrab(W, 0, 14, costumeOf(a.type), false, a.status === 'running')}
 <text class="t" ${startText(W, 42, 18)} font-family="${FONT}" font-size="13" font-weight="600">${xml(fitText(a.description || a.type, 13, textW))}</text>
-<text ${startText(W, 42, 34)} font-family="${FONT}" font-size="11"><tspan fill="${color}">${xml(tier === 'other' ? a.type : tierWord(tier))}</tspan><tspan class="s">  ${xml(meta.join('  ·  '))}</tspan></text>
+<text ${startText(W, 42, 34)} font-family="${FONT}" font-size="11"><tspan fill="${color}">${xml(customAvatarOf(a)?.label ?? (tier === 'other' ? a.type : tierWord(tier)))}</tspan><tspan class="s">  ${xml(meta.join('  ·  '))}</tspan></text>
 ${steps && stepsW > 30 ? `<text class="t" ${startText(W, 42, 49)} font-family="${FONT}" font-size="11" font-variant-numeric="tabular-nums">${xml(fitText(steps, 11, stepsW))}</text>` : ''}
 <text class="s" ${endText(W, 42 + barW, 49, true)} font-family="${FONT}" font-size="11" font-variant-numeric="tabular-nums">${stats}</text>
 <rect class="k" x="${mx(W, 42, barW)}" y="55" width="${barW}" height="4" rx="2"/><rect${progress === null ? ' class="m"' : ''} x="${mx(W, 42, fillW)}" y="55" width="${fillW}" height="4" rx="2"${progress === null ? '' : ` fill="${color}"`}/>
@@ -742,8 +900,8 @@ ${statusMark(mx(W, W - 8), 16, 'planned', color)}
 
 const compactSvg = (W: number, list: AgentRun[], planned: Planned[], t: ReturnType<typeof totals>): string => {
   const icons = [
-    ...list.filter(a => a.status === 'running').map(a => ({ k: costumeOf(a.type), c: colorOf(tierOf(a.type)), s: 'running', dim: false })),
-    ...list.filter(a => a.status !== 'running').map(a => ({ k: costumeOf(a.type), c: colorOf(tierOf(a.type)), s: a.status, dim: false })),
+    ...list.filter(a => a.status === 'running').map(a => ({ k: costumeOf(a.type), c: agentColor(a), s: 'running', dim: false })),
+    ...list.filter(a => a.status !== 'running').map(a => ({ k: costumeOf(a.type), c: agentColor(a), s: a.status, dim: false })),
     ...planned.map(p => ({ k: p.tier in TIER_COLOR ? p.tier : 'other', c: colorOf(p.tier), s: 'planned', dim: true })),
   ]
   const fit = Math.max(1, Math.floor((W - 150) / 36))
@@ -769,6 +927,23 @@ const ctxBar = (pct: number, width: number): string => {
 }
 
 const STATUS_GLYPH: Record<string, string> = { running: '●', done: '✓', failed: '✗', planned: '◷' }
+
+// Clawd in quarter blocks, three rows tall beside each agent row: the avatar of
+// every type the person's avatars file leaves out.
+const CLAWD: Avatar = {
+  art: [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘▘ ▝▝  '],
+  walk: [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▝▘ ▝▘  '],
+}
+const TERM_CRAB_MIN_COLS = 40
+
+// The frame to draw, padded to one width so the text beside it stays put. A running
+// agent with a `walk` frame swaps to it on every other tick of the panel's clock.
+const termAvatar = (a: AgentRun, at: number): { lines: string[]; width: number } => {
+  const { art, walk } = customAvatarOf(a) ?? CLAWD
+  const width = Math.max(...[...art, ...(walk ?? [])].map(widthOf))
+  const frame = walk && a.status === 'running' && Math.floor(at / 1000) % 2 ? walk : art
+  return { lines: frame.map(l => l + ' '.repeat(width - widthOf(l))), width }
+}
 
 // Opens the agents pane, or closes it when it is up; true when it ends up open.
 async function togglePane($: EngineInterface): Promise<boolean> {
@@ -1029,6 +1204,19 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const s = tr()
+    // Resolved while drawing, not at session start: a hot reload starts the module over
+    // without always starting the session again.
+    // An avatars file that cannot be found draws the default crabs, never no panel.
+    try {
+      if (!avatarsPath) {
+        const file = typeof options.avatars === 'string' && options.avatars.trim() ? options.avatars.trim() : DEFAULT_AVATARS
+        const home = file.startsWith('~/') ? await $.env.get('HOME') : ''
+        avatarsPath = home === undefined ? '' : file.startsWith('~/') ? `${home}${file.slice(1)}` : file
+      }
+      if (avatarsPath) await loadAvatars($, avatarsPath)
+    } catch {
+      avatarRules = []
+    }
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
     const list = await read($, agents)
@@ -1115,36 +1303,54 @@ export const register: Register = (on, options) => {
 
     // Terminal: the same content in text rows.
     const cols = Math.max(24, e.props.bodyColumns || 40)
-    const barW = Math.max(6, Math.min(20, cols - 34))
+    // A pane wide enough seats an avatar beside each row; a narrow one keeps the square.
+    const hasCrab = cols >= TERM_CRAB_MIN_COLS
+    // One column for every avatar, as wide as the widest, so the rows' text lines up.
+    const avatarW = hasCrab ? Math.max(0, ...list.map(a => termAvatar(a, at).width)) : 0
     const row = (a: AgentRun) => {
       const tier = tierOf(a.type)
-      const color = colorOf(tier)
+      const color = agentColor(a)
+      const label = customAvatarOf(a)?.label
+      const avatar = hasCrab ? termAvatar(a, at) : null
+      const barW = Math.max(6, Math.min(20, cols - 34 - (avatar ? avatarW + 1 : 0)))
       const ctx = ctxOf(a)
       const progress = progressOf(a)
       const model = runModel(a)
       const steps = a.stepTotal ? `${a.stepDone ?? 0}/${a.stepTotal}${a.stepNote ? ' ' + a.stepNote : ''} · ` : ''
+      const indent = avatar ? '' : '  '
       return (
-        <Box key={a.id} flexDirection="column" marginBottom={1}>
-          <Box flexDirection="row" gap={1}>
-            <Text color={color}>▣</Text>
-            <Text bold wrap="truncate-end">
-              {a.description || a.type}
+        <Box key={a.id} flexDirection="row" gap={1} marginBottom={1}>
+          {avatar && (
+            <Box flexDirection="column" flexShrink={0} width={avatarW}>
+              {avatar.lines.map((line, i) => (
+                <Text key={String(i)} color={a.status === 'failed' ? 'red' : color}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
+          )}
+          <Box flexDirection="column" flexGrow={1}>
+            <Box flexDirection="row" gap={1}>
+              {!avatar && <Text color={color}>▣</Text>}
+              <Text bold wrap="truncate-end">
+                {a.description || a.type}
+              </Text>
+              <Text color={a.status === 'failed' ? 'red' : a.status === 'done' ? 'green' : color}>{STATUS_GLYPH[a.status]}</Text>
+            </Box>
+            <Text dimColor wrap="truncate-end">
+              {indent}
+              {label ?? (tier === 'other' ? a.type : tierWord(tier))} · {model}
+              {a.round > 1 ? ` · ${s.round} ${a.round}` : ''}
             </Text>
-            <Text color={a.status === 'failed' ? 'red' : a.status === 'done' ? 'green' : color}>{STATUS_GLYPH[a.status]}</Text>
+            <Text wrap="truncate-end">
+              {indent}
+              {progress === null ? <Text dimColor>{ctxBar(ctx, barW)}</Text> : <Text color={color}>{ctxBar(progress * 100, barW)}</Text>}
+              <Text dimColor>
+                {' '}
+                {steps}{s.ctx} {ctx}% · {fmtTokens(a.contextTokens)} ≈{fmtCost(a.costUsd)} {fmtTime(elapsed(a, at))}
+              </Text>
+            </Text>
           </Box>
-          <Text dimColor wrap="truncate-end">
-            {'  '}
-            {tier === 'other' ? a.type : tierWord(tier)} · {model}
-            {a.round > 1 ? ` · ${s.round} ${a.round}` : ''}
-          </Text>
-          <Text wrap="truncate-end">
-            {'  '}
-            {progress === null ? <Text dimColor>{ctxBar(ctx, barW)}</Text> : <Text color={color}>{ctxBar(progress * 100, barW)}</Text>}
-            <Text dimColor>
-              {' '}
-              {steps}{s.ctx} {ctx}% · {fmtTokens(a.contextTokens)} ≈{fmtCost(a.costUsd)} {fmtTime(elapsed(a, at))}
-            </Text>
-          </Text>
         </Box>
       )
     }
@@ -1163,7 +1369,7 @@ export const register: Register = (on, options) => {
         {p.isCompact ? (
           <Text wrap="truncate-end">
             {[...running, ...finished].map(a => (
-              <Text key={a.id} color={colorOf(tierOf(a.type))}>
+              <Text key={a.id} color={agentColor(a)}>
                 {STATUS_GLYPH[a.status]}{' '}
               </Text>
             ))}
